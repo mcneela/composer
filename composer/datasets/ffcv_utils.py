@@ -2,13 +2,86 @@ import json
 import logging
 import subprocess
 import textwrap
-from typing import Optional
+from typing import Optional, Sequence
+
+import numpy as np
+import torch
 
 from composer.core.types import Dataset
+from composer.utils import dist
 
 log = logging.getLogger(__name__)
 
-__all__ = ["write_ffcv_dataset"]
+__all__ = ["write_ffcv_dataset", "ffcv_init_sampler"]
+
+try:
+    import ffcv  # type: ignore
+    ffcv_installed = True
+except ImportError:
+    ffcv_installed = False
+
+
+def _require_ffcv():
+    if not ffcv_installed:
+        raise ImportError(
+            textwrap.dedent("""\
+            Composer was installed without ffcv support.
+            To use ffcv with Composer, please install ffcv in your environment."""))
+
+
+class RandomOrder(ffcv.traversal_order.base.TraversalOrder):
+
+    def __init__(self, loader: 'Loader'):
+        super().__init__(loader)
+
+        if self.distributed:
+            self.sampler = torch.utils.data.DistributedSampler(
+                self.indices,
+                shuffle=True,
+                seed=self.seed,
+                drop_last=False,
+                num_replicas=dist.get_world_size(),
+                rank=dist.get_global_rank(),
+            )
+
+    def sample_order(self, epoch: int) -> Sequence[int]:
+        if not self.distributed:
+            generator = np.random.default_rng(self.seed + epoch if self.seed is not None else None)
+            return generator.permutation(self.indices)
+
+        self.sampler.set_epoch(epoch)
+
+        return self.indices[np.array(list(self.sampler))]
+
+
+class SequentialOrder(ffcv.traversal_order.base.TraversalOrder):
+
+    def __init__(self, loader: 'Loader'):
+        super().__init__(loader)
+
+        if self.distributed:
+            self.sampler = torch.utils.data.DistributedSampler(
+                self.indices,
+                shuffle=False,
+                seed=self.seed,
+                drop_last=False,
+                num_replicas=dist.get_world_size(),
+                rank=dist.get_global_rank(),
+            )
+
+    def sample_order(self, epoch: int) -> Sequence[int]:
+        if not self.distributed:
+            return self.indices
+
+        self.sampler.set_epoch(epoch)
+
+        return self.indices[np.array(list(self.sampler))]
+
+
+def ffcv_init_sampler():
+    _require_ffcv()
+    ffcv.loader.loader.ORDER_MAP[ffcv.loader.loader.OrderOption.RANDOM] = RandomOrder
+    ffcv.loader.loader.ORDER_MAP[ffcv.loader.loader.OrderOption.SEQUENTIAL] = SequentialOrder
 
 
 def write_ffcv_dataset(dataset: Optional[Dataset] = None,
@@ -33,14 +106,8 @@ def write_ffcv_dataset(dataset: Optional[Dataset] = None,
         jpeg_quality (float): Quality to use for jpeg compression. Default: ``90``.
         chunk_size (int): Size of chunks processed by each worker during conversion. Default: ``100``.
     """
-    try:
-        import ffcv  # type: ignore
-    except ImportError:
-        raise ImportError(
-            textwrap.dedent("""\
-            Composer was installed without ffcv support.
-            To use ffcv with Composer, please install ffcv in your environment."""))
 
+    _require_ffcv()
     if dataset is None and remote is None:
         raise ValueError("At least one of dataset or remote should not be None.")
 
